@@ -48,6 +48,28 @@ extern lck_mtx_t hakios_rsc_lock;
 
 static vm_offset_t tlmm, gcc, se, rsc, cmd_db;
 
+/* Every line also into the loader's log, as the buttons driver does: seen live (xl log) and kept even if the
+ * kernel's message buffer is lost (renoir bring-up, 9 November 2026). */
+extern void loader_log_putc(char c);
+
+static int say(const char *format, ...) __printflike(1, 2);
+
+static int
+say(const char *format, ...)
+{
+	char line[400];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	for (const char *c = line; *c != 0; c++) {
+		loader_log_putc(*c);
+	}
+	return printf("%s", line);
+}
+#define printf say
+
 static inline uint32_t
 rd(vm_offset_t address)
 {
@@ -81,12 +103,37 @@ sleep_ms(uint32_t ms)
 #define PULL_NONE               0
 #define PULL_UP                 3
 
-#define PIN_MISO                52
-#define PIN_MOSI                53
-#define PIN_CLK                 54
-#define PIN_CS                  55
-#define PIN_INT                 81      /* low = the chip has a report */
-#define PIN_RESET               105     /* low = in reset */
+/*
+ * The pins are the POCO X5 Pro's by default. Boot-arg touch_board=renoir: the Xiaomi Mi 11 Lite 5G
+ * (renoir, SM7350), whose Goodix GT9897T ("Berlin") hangs off QUP0 serial engine 2 (0x988000) -- an
+ * engine its firmware leaves in GSI-only mode (GENI_IF_DISABLE_RO = 1: no FIFO), so the four pins are
+ * always driven by hand there: GPIO20 MISO, 21 MOSI, 22 CLK, 23 CS (mode 0); reset GPIO30, interrupt
+ * GPIO31; both supplies through RPMh: I/O ldoc2 at 1.8 V, analog ldoc7 at 3.3 V (no AVDD switch pin).
+ * Measured on renoir 9 November 2026 with the ios-sweet shim: rom "BERLIN", patch "9897T", touch report
+ * at 0x10338, coordinates 1:1 with the 1080 x 2400 panel.
+ */
+static unsigned PIN_MISO = 52, PIN_MOSI = 53, PIN_CLK = 54, PIN_CS = 55;
+static unsigned PIN_INT = 81;           /* low = the chip has a report */
+static unsigned PIN_RESET = 105;        /* low = in reset */
+static bool board_renoir;
+
+static void
+board_select(void)
+{
+	char board[16] = { 0 };
+	boolean_t found = PE_parse_boot_arg_str("touch_board", board, sizeof(board));
+
+	printf("goodix: thread started; touch_board %s \"%s\"\n", found ? "=" : "not given,", board);
+	if (found && strcmp(board, "renoir") == 0) {
+		board_renoir = true;
+		PIN_MISO = 20;
+		PIN_MOSI = 21;
+		PIN_CLK = 22;
+		PIN_CS = 23;
+		PIN_INT = 31;
+		PIN_RESET = 30;
+	}
+}
 #define PIN_AVDD                107     /* high = analog supply on */
 #define PIN_FOCALTECH_ID        68      /* FocalTech if this reads 0 ... */
 #define PIN_GOODIX_ID           96      /* ... and this reads 1 (sm8350-kernel-OKX convention) */
@@ -266,6 +313,25 @@ io_supply_on(void)
 		return false;
 	}
 	printf("goodix: I/O supply on (1.8 V)\n");
+	return true;
+}
+
+/* renoir: the chip's analog supply, 3.3 V from LDO7 of the PM8350C ("ldoc7"), through RPMh like the I/O one. */
+static bool
+analog_supply_on(void)
+{
+	uint32_t base = rpmh_address("ldoc7");
+	uint32_t address[3] = { base + VRM_VOLTAGE, base + VRM_ENABLE, base + VRM_MODE };
+	uint32_t data[3] = { 3300, 1, VRM_MODE_LDO_HPM };
+
+	if (base == 0 || (base >> 16 & 0xf) != 4) {
+		printf("goodix: RPMh: no regulator \"ldoc7\" (address %#x)\n", base);
+		return false;
+	}
+	if (!rpmh_write(address, data, 3)) {
+		return false;
+	}
+	printf("goodix: analog supply on (ldoc7 at %#x, 3.3 V)\n", base);
 	return true;
 }
 
@@ -566,7 +632,7 @@ geni_transfer(const uint8_t *tx, uint8_t *rx, uint32_t length)
 
 /* ---- SPI by hand, on the same pins ----------------------------------------------------------------- */
 
-static unsigned bitbang_in = PIN_MISO, bitbang_out = PIN_MOSI;
+static unsigned bitbang_in, bitbang_out;
 
 static void
 bitbang_init(void)
@@ -604,13 +670,21 @@ static bool (*spi_transfer)(const uint8_t *tx, uint8_t *rx, uint32_t length);
 
 #define GOODIX_FW_VERSION       0x10014         /* 28 bytes */
 #define GOODIX_IC_INFO          0x10070         /* a 16-bit length, then that many bytes */
+/*
+ * renoir's GT9897T speaks the older Berlin dialect (Xiaomi's gt9897t/goodix_brl_spi.c): a read is 0xf1, the
+ * address and FOUR dummy bytes (not three), and the two blocks sit 8 bytes lower. Its version block is not
+ * summed like the GT9916's; the chip is told by "9897" in its patch id instead.
+ */
+#define GT9897_FW_VERSION       0x1000c
+#define GT9897_IC_INFO          0x10068
+static uint32_t read_dummies = 3;
 #define GOODIX_MAX_READ         1024
 #define GOODIX_MAX_TOUCHES      10
 #define GOODIX_STATUS_TOUCH     0x80
 #define GOODIX_STATUS_REQUEST   0x40
 #define GOODIX_REQUEST_RESET    3
 
-static uint8_t spi_tx[8 + GOODIX_MAX_READ], spi_rx[8 + GOODIX_MAX_READ];
+static uint8_t spi_tx[9 + GOODIX_MAX_READ], spi_rx[9 + GOODIX_MAX_READ];
 static uint32_t touch_address, command_address;
 static const char *report_rate = "240";        /* what the status line says (touch_rate=480) */
 static uint32_t max_x = 10800, max_y = 24000;   /* the device tree's; the chip may say otherwise */
@@ -626,12 +700,14 @@ goodix_read(uint32_t address, uint8_t *data, uint32_t length)
 	spi_tx[2] = (uint8_t)(address >> 16);
 	spi_tx[3] = (uint8_t)(address >> 8);
 	spi_tx[4] = (uint8_t)address;
-	spi_tx[5] = spi_tx[6] = spi_tx[7] = 0xff;
-	memset(spi_tx + 8, 0, length);
-	if (!spi_transfer(spi_tx, spi_rx, 8 + length)) {
+	for (uint32_t i = 0; i < read_dummies; i++) {
+		spi_tx[5 + i] = 0xff;
+	}
+	memset(spi_tx + 5 + read_dummies, 0, length);
+	if (!spi_transfer(spi_tx, spi_rx, 5 + read_dummies + length)) {
 		return false;
 	}
-	memcpy(data, spi_rx + 8, length);
+	memcpy(data, spi_rx + 5 + read_dummies, length);
 	return true;
 }
 
@@ -696,10 +772,10 @@ goodix_probe(bool verbose)
 	uint8_t version[28];
 	uint32_t length, offset;
 
-	if (!goodix_read(GOODIX_FW_VERSION, version, sizeof(version))) {
+	if (!goodix_read(board_renoir ? GT9897_FW_VERSION : GOODIX_FW_VERSION, version, sizeof(version))) {
 		return false;
 	}
-	if (!goodix_checksum_ok(version, sizeof(version))) {
+	if (board_renoir ? memcmp(version + 10, "9897", 4) != 0 : !goodix_checksum_ok(version, sizeof(version))) {
 		if (verbose) {
 			printf("goodix: no valid firmware version: %02x %02x %02x %02x %02x %02x %02x %02x ... %02x %02x\n",
 			    version[0], version[1], version[2], version[3], version[4], version[5], version[6], version[7],
@@ -710,12 +786,14 @@ goodix_probe(bool verbose)
 	printf("goodix: chip \"%.6s\", firmware \"%.8s\" %02x.%02x.%02x.%02x, sensor %u\n", (const char *)version,
 	    (const char *)version + 10, version[18], version[19], version[20], version[21], version[23]);
 
-	if (!goodix_read(GOODIX_IC_INFO, info, 2)) {
+	uint32_t ic_info = board_renoir ? GT9897_IC_INFO : GOODIX_IC_INFO;
+
+	if (!goodix_read(ic_info, info, 2)) {
 		return false;
 	}
 	length = le16(info);
-	if (length < 40 || length >= GOODIX_MAX_READ || !goodix_read(GOODIX_IC_INFO, info, length) ||
-	    !goodix_checksum_ok(info, length)) {
+	if (length < 40 || length >= GOODIX_MAX_READ || !goodix_read(ic_info, info, length) ||
+	    (!board_renoir && !goodix_checksum_ok(info, length))) {
 		printf("goodix: bad chip description (length %u)\n", length);
 		return false;
 	}
@@ -733,7 +811,7 @@ goodix_probe(bool verbose)
 	}
 	touch_address = le32(info + offset + 44);
 	command_address = le32(info + offset + 0);      /* (the "misc" part: the command buffer comes first) */
-	if (offset + 122 + 20 + 2 <= length) {
+	if (!board_renoir && offset + 122 + 20 + 2 <= length) {   /* renoir: 1:1 with the 1080 x 2400 panel, measured */
 		uint16_t x = le16(info + offset + 122 + 16), y = le16(info + offset + 122 + 18);
 
 		if (x && y) {
@@ -1375,7 +1453,13 @@ power_on(void)
 		return false;
 	}
 	sleep_ms(3);
-	gpio_output(PIN_AVDD, true, PULL_NONE, 2);
+	if (board_renoir) {
+		if (!analog_supply_on()) {
+			return false;
+		}
+	} else {
+		gpio_output(PIN_AVDD, true, PULL_NONE, 2);
+	}
 	sleep_ms(15);
 	return true;
 }
@@ -1400,6 +1484,26 @@ bring_up(void)
 {
 	const char *problem = "its clocks cannot be turned on";
 
+	if (board_renoir) {
+		touch_chip = TOUCH_GOODIX;
+		read_dummies = 4;
+		max_x = 1080;
+		max_y = 2400;
+		printf("goodix: board renoir: GT9897T on gpio20-23 by hand, reset gpio30, interrupt gpio31\n");
+		if (!power_on()) {
+			printf("goodix: the supplies are not on; the chip is left alone\n");
+			return false;
+		}
+		spi_transfer = bitbang_transfer;
+		bitbang_in = PIN_MISO;
+		bitbang_out = PIN_MOSI;
+		bitbang_init();
+		if (chip_probe(true)) {
+			printf("goodix: renoir: the chip answers (data in on gpio%u)\n", bitbang_in);
+			return true;
+		}
+		return false;
+	}
 	show_state("as found");
 	touch_chip = touch_chip_detect();
 	printf("goodix: ID gpio96=%u gpio68=%u: selected %s\n", gpio_get(PIN_GOODIX_ID),
@@ -1488,6 +1592,7 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 		poll_us = 8000;
 	}
 	idle_looks = 16000 / poll_us;   /* a report read every 16 ms even with the line high, in case it is missed */
+	board_select();
 
 	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
 	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
