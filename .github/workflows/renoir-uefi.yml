@@ -1,0 +1,53 @@
+# HakiOS UEFI for the Xiaomi Mi 11 Lite 5G (renoir, SM7350): Project Silicium's renoir platform at the
+# Mu-Silicium commit HakiOS builds on, with HakiOS's changes (uefi/hakios.patch: the boot shim copies the
+# XNUP payload to 0xF0000000, the boot manager starts the XNU loader) and a 64 MiB "XNU Payload" carve-out
+# at 0xF0000000 (plain RAM on renoir: DDR 0xC0000000-0xFFFFFFFF, nothing reserved above 0xE3400000).
+# The artifact has the pieces mkxnuimg.py packs: BootShim.bin, SILICIUM_UEFI.fd, device-tree.dtb,
+# ramdisk, mkbootimg.py, and the plain image Mu-renoir.img (no payload).
+name: renoir UEFI
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mu-Silicium + HakiOS changes
+        run: |
+          set -ex
+          git clone https://github.com/oosexgang/hakios-uefi.git uefi
+          git -C uefi checkout -q 1c6522893266157506c767e2ca427053ed3634a8
+          git clone https://github.com/Project-Silicium/Mu-Silicium.git Mu-Silicium
+          git -C Mu-Silicium checkout -q "$(cat uefi/BASE)"
+          git -C Mu-Silicium submodule update --init --recursive
+          git -C Mu-Silicium apply --whitespace=nowarn "$PWD/uefi/hakios.patch"
+          cp -r uefi/files/. Mu-Silicium/
+          python3 uefi/branding/banner.py Mu-Silicium/Silicon/Silicium/SiliciumPkg/Include/Resources
+          MM=Mu-Silicium/Platforms/Xiaomi/renoirPkg/Library/MemoryMapLib/MemoryMapLib.c
+          sed -i '/"Display Reserved"/a\  {"XNU Payload",       0xF0000000, 0x04000000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},' "$MM"
+          grep -n -A1 '"Display Reserved"' "$MM"
+      - name: Build
+        working-directory: Mu-Silicium
+        env:
+          CI_BUILD: "true"
+        run: |
+          bash ./setup_env.sh -p apt
+          python3 build_uefi.py -d renoir -r RELEASE -c
+          ls -l Build/renoirPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd; ls -l Mu-*.img || true
+      - name: Boot shim with the payload copy
+        working-directory: Mu-Silicium/BootShim
+        run: |
+          rm -f BootShim.elf BootShim.bin
+          make REQUIRES_KERNEL_HEADER=1 FD_BASE=0x9FD00000 FD_SIZE=0x200000 \
+            'CFLAGS=--target=aarch64-linux-gnu -DPAYLOAD_BASE=0xF0000000'
+      - name: Collect
+        run: |
+          mkdir out
+          cp Mu-Silicium/BootShim/BootShim.bin Mu-Silicium/Build/renoirPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd out/
+          cp Mu-Silicium/Resources/DTBs/renoir.dtb out/device-tree.dtb
+          cp Mu-Silicium/Resources/ramdisk Mu-Silicium/Resources/Scripts/mkbootimg.py out/
+          cp Mu-Silicium/Mu-*.img out/ || true
+          (cd out && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: renoir-uefi
+          path: out/
