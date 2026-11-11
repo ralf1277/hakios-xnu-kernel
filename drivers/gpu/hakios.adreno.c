@@ -697,6 +697,16 @@ step_clocks(void)
  */
 #define GCC_DEBUG_MUX           0x62000         /* [9:0] which clock goes to the counter */
 #define GCC_DEBUG_MUX_GPUCC     0x146           /* ... the debug output of the GPU's clock controller */
+/*
+ * Boot-arg adreno_board=renoir: the Xiaomi Mi 11 Lite 5G (SM7350 "shima", Adreno 642, qcom,chipid 0x06060010:
+ * an A660-family core like this one, same firmware names, same GPU block addresses). Measured there on
+ * 11 November 2026: steps 1 to 4 as they are; the global clock controller routes the GPU's clock controller to
+ * the frequency counter with 0x13c (the vendor kernel's drivers/clk/qcom/debugcc-shima.c: shima is not
+ * SM8350 there, whose 0x153 is an SD card clock on shima), not 0x146. Clock registers and parents as here
+ * (gcc-shima.c, gpucc-shima.c).
+ */
+static bool board_renoir;
+static uint32_t gcc_debug_mux_gpucc = GCC_DEBUG_MUX_GPUCC;
 #define GCC_DEBUG_DIV           0x62004         /* [3:0] divider - 1; both controllers divide by 2 */
 #define GCC_DEBUG_CBCR          0x62008
 #define GCC_XO_DIV4_CBCR        0x6200c         /* the counter's time base: the crystal / 4, 4.8 MHz */
@@ -756,7 +766,7 @@ measure(uint32_t select)
 	put(&gpucc, "debug mux", GPUCC_DEBUG_MUX, (gpu_mux & ~0xffu) | select);
 	put(&gpucc, "debug divider", GPUCC_DEBUG_DIV, (gpu_div & ~0xfu) | 1);
 	put(&gpucc, "debug output", GPUCC_DEBUG_CBCR, gpu_cbcr | CBCR_ENABLE);
-	put(&gcc, "debug mux", GCC_DEBUG_MUX, (mux & ~0x3ffu) | GCC_DEBUG_MUX_GPUCC);
+	put(&gcc, "debug mux", GCC_DEBUG_MUX, (mux & ~0x3ffu) | gcc_debug_mux_gpucc);
 	put(&gcc, "debug divider", GCC_DEBUG_DIV, (div & ~0xfu) | 1);
 	put(&gcc, "debug input", GCC_DEBUG_CBCR, cbcr | CBCR_ENABLE);
 	put(&gcc, "crystal/4", GCC_XO_DIV4_CBCR, base | CBCR_ENABLE);
@@ -1879,6 +1889,9 @@ step_gmu_firmware(void)
 #define GMU_AO_AHB_FENCE_CTRL   GMU_WORD(0x9310)
 #define GMU_AHB_FENCE_RANGE_0   GMU_WORD(0x9311)
 #define GMU_CHIP                0x06035000      /* dt qcom,chipid 0x06030500 the way the firmware wants it */
+#define GMU_CHIP_RENOIR         0x16060000      /* renoir: 0x06060010 as the vendor driver gives it (adreno_a6xx_gmu.c,
+						 * a6xx_gmu_fw_start): core and major as they are, minor << 12, the low nibble of
+						 * the patch << 8, and for an A642 the high nibble of the patch (the "target", 1) << 28 */
 #define GMU_STARTED_MASK        0x1ff           /* of fw_init_result, for firmware newer than core 0x20010004 */
 #define GMU_STARTED             0x100
 #define GMU_FAILED              0xe00
@@ -1960,7 +1973,7 @@ step_gmu_start(void)
 	put(&gmu, "cm3_cfg", GMU_CM3_CFG, 0x4052);
 	put(&gbif, "halt", GBIF_HALT, 0);
 	put(&gmu, "pwr_col_cp_resp", GMU_PWR_COL_CP_RESP, 0);
-	put(&gmu, "hfi_sfr_addr", GMU_HFI_SFR_ADDR, GMU_CHIP);
+	put(&gmu, "hfi_sfr_addr", GMU_HFI_SFR_ADDR, board_renoir ? GMU_CHIP_RENOIR : GMU_CHIP);
 	put(&gmu, "pwr_col_cp_msg", GMU_PWR_COL_CP_MSG, GMU_LOG_ADDRESS | (GMU_LOG_SIZE / 4096 - 1));
 	put(&gmu, "sys_bus_config", GMU_SYS_BUS_CONFIG, 1);
 	put(&gmu, "icache_config", GMU_ICACHE_CONFIG, 1);
@@ -2287,7 +2300,10 @@ step_core_power(void)
 {
 	static const struct {
 		uint32_t khz, level;
-	} speeds[] = { { 0, 0 }, { 315000, 64 }, { 450000, 128 }, { 550000, 192 } };
+	} speeds_poco[] = { { 0, 0 }, { 315000, 64 }, { 450000, 128 }, { 550000, 192 } },
+	/* renoir: three of its own (dt qcom,gpu-pwrlevels-0, speed bin 0: 285, 443, 540 MHz at levels 64, 128, 192) */
+	  speeds_renoir[] = { { 0, 0 }, { 285000, 64 }, { 443000, 128 }, { 540000, 192 } };
+	const __typeof__(speeds_poco[0]) *speeds = board_renoir ? speeds_renoir : speeds_poco;
 	static struct hfi_perf_table perf;
 	static struct hfi_bw_table bw;
 	uint32_t core_start[2] = { 0, 0 }, start[1] = { 0 }, vote[4] = { 0, 1, 3, HFI_NO_INDEX }, granted = 0, speed = 0;
@@ -2302,7 +2318,7 @@ step_core_power(void)
 		printf("adreno: %u: RPMh's list lacks one of the rails\n", step);
 		return false;
 	}
-	perf.gpu_levels = sizeof(speeds) / sizeof(speeds[0]);
+	perf.gpu_levels = sizeof(speeds_poco) / sizeof(speeds_poco[0]);
 	for (unsigned i = 0; i < perf.gpu_levels; i++) {
 		perf.gpu[i].khz = speeds[i].khz;
 		perf.gpu[i].acd = 0xffffffff;           /* no adaptive clocking */
@@ -3765,6 +3781,17 @@ hakios_adreno_init(void)
 	uint32_t only = 0, done = 0, failed = 0, keep = 0;
 	bool by_itself = false;
 
+	{
+		char board[16] = { 0 };
+
+		if (PE_parse_boot_arg_str("adreno_board", board, sizeof(board)) && strcmp(board, "renoir") == 0) {
+			board_renoir = true;
+			gcc_debug_mux_gpucc = 0x13c;
+		}
+		if (board_renoir) {
+			printf("adreno: board renoir (Adreno 642 of the SM7350, chip 0x06060010)\n");
+		}
+	}
 	if (PE_parse_boot_argn("display_probe", &only, sizeof(only)) && only) {
 		display_probe();
 	}
